@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score
 
 # Configuration générale de la page web
 st.set_page_config(
@@ -24,21 +25,13 @@ def pc(val):
 # ==============================================================================
 @st.cache_data
 def charger_donnees():
-    # Lecture du fichier CSV placé dans le même dossier que app.py
     df = pd.read_csv("reservations_hotels.csv")
-    
-    # Correction des valeurs manquantes dans 'enfants' (remplacées par 0)
     df["enfants"] = df["enfants"].fillna(0)
-    
-    # Suppression des réservations impossibles (0 occupant ou prix négatif)
     cond_sans_occupant = (df["adultes"] + df["enfants"]) == 0
     cond_prix_negatif = df["prix_nuit"] < 0
     propres = df[~(cond_sans_occupant | cond_prix_negatif)].copy()
-    
-    # Calcul du chiffre d'affaires potentiel de chaque réservation et du mois d'arrivée
     propres["ca"] = propres["prix_nuit"] * propres["nuits"]
     propres["annee_mois"] = propres["date_arrivee"].str.slice(0, 7)
-    
     return propres
 
 propres = charger_donnees()
@@ -49,7 +42,6 @@ propres = charger_donnees()
 # ==============================================================================
 @st.cache_resource
 def entrainer_modele(df):
-    # Sélection stricte des 13 variables connues dès la réservation (aucune fuite de données)
     variables = [
         "hotel", "mois", "delai_reservation", "nuits", "adultes", "enfants",
         "segment", "type_client", "client_habitue", "annulations_precedentes",
@@ -57,22 +49,23 @@ def entrainer_modele(df):
     ]
     colonnes_quali = ["hotel", "mois", "segment", "type_client", "depot"]
     
-    # Transformation des variables qualitatives en indicatrices (0 ou 1)
     X = pd.get_dummies(df[variables], columns=colonnes_quali, dtype=int)
     y = df["annulee"]
     
-    # Découpage chronologique : apprentissage sur les arrivées avant le 1er janvier 2017
+    # Découpage chronologique : apprentissage avant 2017, test sur 2017
     avant_2017 = df["date_arrivee"] < "2017-01-01"
-    X_train = X[avant_2017]
-    y_train = y[avant_2017]
+    X_train, y_train = X[avant_2017], y[avant_2017]
+    X_test, y_test = X[~avant_2017], y[~avant_2017]
     
-    # Entraînement de la régression logistique
     modele = LogisticRegression(max_iter=3000)
     modele.fit(X_train, y_train)
     
-    return modele, X.columns.tolist(), variables, colonnes_quali
+    # Probabilités calculées sur le jeu de test 2017 pour afficher exactitude, précision et rappel
+    proba_test = modele.predict_proba(X_test)[:, 1]
+    
+    return modele, X.columns.tolist(), variables, colonnes_quali, proba_test, y_test
 
-modele, colonnes_X, variables_modele, colonnes_quali = entrainer_modele(propres)
+modele, colonnes_X, variables_modele, colonnes_quali, proba_test, y_test = entrainer_modele(propres)
 
 
 # ==============================================================================
@@ -80,15 +73,12 @@ modele, colonnes_X, variables_modele, colonnes_quali = entrainer_modele(propres)
 # ==============================================================================
 st.sidebar.header("Filtres du tableau de bord")
 
-# Filtre 1 : Établissement (Lisbonne / Algarve)
 hotels_dispo = ["Tous les hôtels"] + sorted(propres["hotel"].unique().tolist())
 choix_hotel = st.sidebar.selectbox("Hôtel", hotels_dispo)
 
-# Filtre 2 : Année d'arrivée
 annees_dispo = ["Toutes les années"] + sorted(propres["annee"].astype(str).unique().tolist())
 choix_annee = st.sidebar.selectbox("Année d'arrivée", annees_dispo)
 
-# Filtre 3 : Segment de clientèle
 segments_dispo = sorted(propres["segment"].unique().tolist())
 choix_segments = st.sidebar.multiselect(
     "Segments de clientèle",
@@ -96,7 +86,6 @@ choix_segments = st.sidebar.multiselect(
     default=segments_dispo
 )
 
-# Application des filtres choisis sur les données propres
 df_filtre = propres.copy()
 if choix_hotel != "Tous les hôtels":
     df_filtre = df_filtre[df_filtre["hotel"] == choix_hotel]
@@ -130,21 +119,18 @@ with onglet_kpi:
         realisees = df_filtre[df_filtre["annulee"] == 0]
         annulees = df_filtre[df_filtre["annulee"] == 1]
 
-        # Calcul des 5 indicateurs de base
         taux_annul = df_filtre["annulee"].mean()
         ca_realise = realisees["ca"].sum()
         nuits_vendues = realisees["nuits"].sum()
         prix_moyen = ca_realise / nuits_vendues if nuits_vendues > 0 else 0
         ca_annule = annulees["ca"].sum()
 
-        # Calcul des 4 indicateurs complémentaires
         part_famille = (realisees["enfants"] > 0).mean() if len(realisees) > 0 else 0
         part_fidele = (realisees["client_habitue"] == 1).mean() if len(realisees) > 0 else 0
         alos = realisees["nuits"].mean() if len(realisees) > 0 else 0
         ca_non_couvert = annulees[annulees["depot"] != "Non remboursable"]["ca"].sum()
         taux_perte_seche = (ca_non_couvert / ca_annule) if ca_annule > 0 else 0
 
-        # Affichage ligne 1 : les 5 indicateurs principaux
         st.subheader("Indicateurs clés d'activité et de chiffre d'affaires")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Taux d'annulation", pc(taux_annul))
@@ -153,7 +139,6 @@ with onglet_kpi:
         c4.metric("Prix moyen / nuit", f"{fr(prix_moyen, 2)} €")
         c5.metric("CA annulé", f"{fr(ca_annule)} €")
 
-        # Affichage ligne 2 : les 4 indicateurs complémentaires
         st.subheader("Profil de la clientèle et exposition financière")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Clientèle familiale", pc(part_famille))
@@ -163,7 +148,6 @@ with onglet_kpi:
 
         st.divider()
 
-        # Graphiques ligne 1 : CA mensuel et taux d'annulation par délai
         col_g1, col_g2 = st.columns(2)
 
         with col_g1:
@@ -195,7 +179,6 @@ with onglet_kpi:
             plt.tight_layout()
             st.pyplot(fig2)
 
-        # Graphiques ligne 2 : taux d'annulation par dépôt et par segment
         col_g3, col_g4 = st.columns(2)
 
         with col_g3:
@@ -224,7 +207,7 @@ with onglet_kpi:
 # ONGLET 2 : OUTIL DE PRÉVISION D'UNE RÉSERVATION
 # ------------------------------------------------------------------------------
 with onglet_prevision:
-    st.subheader("Évaluer le risque d'annulation d'une nouvelle réservation")
+    st.subheader("Performance du modèle et choix du seuil (jeu de test 2017)")
     st.markdown(
         "Le modèle utilise uniquement les informations connues **au moment de la réservation**. "
         "Le seuil par défaut est fixé à **0,60 (60 %)** afin de limiter les fausses alertes de surréservation."
@@ -237,6 +220,22 @@ with onglet_prevision:
         value=0.60,
         step=0.05
     )
+
+    # Calcul dynamique de l'exactitude, la précision et le rappel selon le seuil choisi
+    prev_test = (proba_test >= seuil).astype(int)
+    exactitude_val = accuracy_score(y_test, prev_test)
+    precision_val = precision_score(y_test, prev_test, zero_division=0)
+    rappel_val = recall_score(y_test, prev_test, zero_division=0)
+    reference_val = 1 - y_test.mean()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Exactitude (vs référence 61,3 %)", pc(exactitude_val))
+    m2.metric("Précision (fiabilité des alertes)", pc(precision_val))
+    m3.metric("Taux de rappel (annulations détectées)", pc(rappel_val))
+    m4.metric("Référence (toujours non annulée)", pc(reference_val))
+
+    st.divider()
+    st.subheader("Évaluer le risque d'annulation d'une nouvelle réservation")
 
     with st.form("form_prevision"):
         col1, col2, col3 = st.columns(3)
@@ -279,7 +278,6 @@ with onglet_prevision:
             "demandes_speciales": in_demandes
         }])
 
-        # Même encodage que lors de l'entraînement du modèle
         X_new = pd.get_dummies(nouvelle_resa[variables_modele], columns=colonnes_quali, dtype=int)
         X_new = X_new.reindex(columns=colonnes_X, fill_value=0)
 
